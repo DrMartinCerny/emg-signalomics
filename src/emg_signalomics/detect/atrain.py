@@ -38,6 +38,16 @@ Detection pipeline (five stages)
   5. Duration filter  — A-train candidates shorter than ac_min_dur_ms are discarded.
                         Very brief detections are most likely artefactual.
 
+Performance optimisation
+------------------------
+Because silence typically constitutes ~95 % of the signal, autocorrelation (the
+dominant cost) is computed only on *active chunks*: contiguous regions whose
+rolling RMS exceeds rms_silence_threshold_uv.  Each active region is padded on
+both sides by enough samples to guarantee that AC windows centred near the chunk
+boundary have complete data.  Overlapping padded chunks are merged before
+processing.  The full (T, n_lags) AC matrix is allocated up-front and filled
+only in the processed regions; all other entries remain NaN.
+
 Public API
 ----------
 detect_atrains(signal_uv, fs, *, lowcut, highcut,
@@ -60,6 +70,83 @@ False for boolean masks.
 """
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Internal helper: fast vectorised rolling RMS via stride tricks
+# ---------------------------------------------------------------------------
+
+def _rolling_rms(x, win_samp, step_samp):
+    """
+    Compute rolling RMS of *x* using a strided view — no Python loop.
+
+    Returns
+    -------
+    rms    : (n_windows,) float
+    starts : (n_windows,) int   — start index of each window in x
+    """
+    starts  = np.arange(0, len(x) - win_samp + 1, step_samp)
+    # Build a (n_windows, win_samp) view without copying data
+    shape   = (len(starts), win_samp)
+    strides = (x.strides[0] * step_samp, x.strides[0])
+    frames  = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    rms     = np.sqrt(np.mean(frames ** 2, axis=1))
+    return rms, starts
+
+
+# ---------------------------------------------------------------------------
+# Internal helper: find active sample ranges from a per-window above-threshold mask
+# ---------------------------------------------------------------------------
+
+def _active_chunks(above_mask, win_starts, win_samp, pad_samp, signal_len):
+    """
+    Convert a per-window above-silence mask into merged, padded sample intervals.
+
+    Each window that is above threshold contributes the half-open interval
+    [win_start, win_start + win_samp).  These intervals are unioned, then padded
+    on both sides by *pad_samp* samples, clipped to [0, signal_len), and finally
+    adjacent/overlapping intervals are merged.
+
+    Parameters
+    ----------
+    above_mask  : (n_windows,) bool
+    win_starts  : (n_windows,) int
+    win_samp    : int
+    pad_samp    : int   — padding added to both sides of each active region
+    signal_len  : int   — total signal length T
+
+    Returns
+    -------
+    chunks : list of (start, end) int tuples — half-open sample intervals,
+             sorted and non-overlapping.  Empty list if no active windows.
+    """
+    if not np.any(above_mask):
+        return []
+
+    # Build sorted list of active windows
+    active_starts = win_starts[above_mask]
+    active_ends   = active_starts + win_samp
+
+    # Pad
+    active_starts = np.maximum(0,           active_starts - pad_samp)
+    active_ends   = np.minimum(signal_len,  active_ends   + pad_samp)
+
+    # Sort by start, then merge overlapping / adjacent intervals
+    order  = np.argsort(active_starts)
+    starts = active_starts[order]
+    ends   = active_ends[order]
+
+    merged = []
+    cs, ce = int(starts[0]), int(ends[0])
+    for s, e in zip(starts[1:], ends[1:]):
+        s, e = int(s), int(e)
+        if s <= ce:         # overlap or adjacent → extend
+            ce = max(ce, e)
+        else:               # gap → commit current chunk, start new one
+            merged.append((cs, ce))
+            cs, ce = s, e
+    merged.append((cs, ce))
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +174,7 @@ def _sliding_autocorr_map(x, fs, win_ms, step_ms, lag_lo_hz, lag_hi_hz):
 
     Parameters
     ----------
-    x          : (T,) float — input signal
+    x          : (T,) float — input signal (may be a chunk, not the full signal)
     fs         : float      — sampling rate (Hz)
     win_ms     : float      — requested window length (ms); may be extended by clamping
     step_ms    : float      — step between successive window centres (ms)
@@ -107,34 +194,30 @@ def _sliding_autocorr_map(x, fs, win_ms, step_ms, lag_lo_hz, lag_hi_hz):
     step_samp = max(1, int(step_ms / 1000.0 * fs))
 
     # Convert frequency bounds to sample lags.
-    # lag_lo_hz (= HIGHCUT) → shorter lag (fewer samples)
-    # lag_hi_hz (= LOWCUT)  → longer  lag (more  samples)
     lag_lo_samp = max(1, int(fs / lag_lo_hz))
     lag_hi_samp = int(fs / lag_hi_hz) + 1
     lags   = np.arange(lag_lo_samp, lag_hi_samp + 1)
     lag_ms = lags / fs * 1000.0
 
     # Clamp window length
-    win_samp = max(win_samp, lag_hi_samp * 3)   # at least 3 cycles at lowest freq
-    win_samp = min(win_samp, len(x) // 2)        # at most half the signal
+    win_samp = max(win_samp, lag_hi_samp * 3)
+    win_samp = min(win_samp, len(x) // 2)
 
     starts = np.arange(0, len(x) - win_samp, step_samp)
     if len(starts) == 0:
-        # Signal too short for even one window — return a single NaN column
         dummy = np.full((len(lags), 1), np.nan)
         return dummy, lag_ms, np.array([len(x) / 2 / fs * 1000.0]), np.array([0]), win_samp
 
     ac_matrix = np.full((len(lags), len(starts)), np.nan)
     for j, s in enumerate(starts):
         win  = x[s : s + win_samp]
-        win  = win - win.mean()           # remove DC offset within window
-        norm = np.dot(win, win)           # Σ x² — zero norm means flat window
+        win  = win - win.mean()
+        norm = np.dot(win, win)
         if norm == 0:
-            continue                      # leave this column as NaN
+            continue
         for li, lag in enumerate(lags):
             if lag >= win_samp:
                 continue
-            # Dot product of win with its lagged copy, normalised by win energy
             ac_matrix[li, j] = np.dot(win[:-lag], win[lag:]) / norm
 
     win_centers_ms = (starts + win_samp // 2) / fs * 1000.0
@@ -173,7 +256,7 @@ def _merge_atrain_gaps(win_mask, max_gap_steps):
             if in_gap:
                 gap_len = i - gap_start
                 if gap_len <= max_gap_steps:
-                    merged[gap_start:i] = True   # bridge this gap
+                    merged[gap_start:i] = True
                 in_gap = False
         else:
             if not in_gap:
@@ -210,7 +293,6 @@ def _discard_short_atrains(atrain_mask, times_s, min_dur_s):
     starts = list(np.where(edges == 1)[0] + 1)
     ends   = list(np.where(edges == -1)[0] + 1)
 
-    # Handle A-trains that begin or end at the array boundary
     if atrain_mask[0]:
         starts = [0] + starts
     if atrain_mask[-1]:
@@ -218,7 +300,7 @@ def _discard_short_atrains(atrain_mask, times_s, min_dur_s):
 
     for s, e in zip(starts, ends):
         if (times_s[e - 1] - times_s[s]) < min_dur_s:
-            out[s:e] = False   # too short — discard
+            out[s:e] = False
 
     return out
 
@@ -257,206 +339,205 @@ def detect_atrains(
         Sampling rate in Hz.
     lowcut : float
         Lower edge of the target oscillation band (Hz).
-        Defines the longest autocorrelation lag evaluated (lag = fs / lowcut).
     highcut : float
         Upper edge of the target oscillation band (Hz).
-        Defines the shortest autocorrelation lag evaluated (lag = fs / highcut).
     ac_window_ms : float
         Duration of each sliding autocorrelation window (ms).
-        Longer windows give more stable AC estimates but reduce temporal
-        resolution.  The actual window used may be longer if 3-cycle clamping
-        forces an extension.
     ac_step_ms : float
-        Step between successive window centres (ms).  Controls temporal
-        resolution of the A-train boundary estimates.  Smaller = finer, slower.
+        Step between successive window centres (ms).
     ac_core_threshold : float  in [0, 1]
-        Peak-AC value required to *seed* an A-train candidate.  Should be
-        set high (e.g. 0.70) so that only clearly periodic windows act as
-        seeds, keeping false-positive A-trains rare.
+        Peak-AC value required to *seed* an A-train candidate.
     ac_adjacent_threshold : float  in [0, 1]
-        Peak-AC value required to *extend* an existing A-train candidate into
-        a neighbouring window.  Must be ≤ ac_core_threshold.  The lower this
-        is, the more the detected A-train extends into its flanks.
+        Peak-AC value required to *extend* an existing A-train candidate.
     ac_merge_gap_ms : float
-        Maximum gap duration (ms) between two A-train candidates that will be
-        bridged into a single A-train.
+        Maximum gap duration (ms) between candidates to bridge.
     ac_min_dur_ms : float
-        Minimum duration (ms) an A-train must have to survive the final filter.
+        Minimum duration (ms) for a surviving A-train.
     rms_silence_threshold_uv : float
-        Windows whose RMS amplitude falls below this value (µV) are excluded
-        from all detection stages, including gap bridging.
+        Windows below this RMS (µV) are excluded from all detection stages.
 
     Returns
     -------
     dict with keys:
 
     "atrains" : (T,) bool
-        Final A-train mask.  True at every sample that belongs to a confirmed
-        A-train after all five pipeline stages.
+        Final A-train mask.
 
     "silence" : (T,) bool
-        Silence mask.  True at every sample whose AC window had
-        RMS < rms_silence_threshold_uv.  Samples not covered by any window
-        (signal edges) are marked False (not silent).
+        Silence mask (True = silent).
 
     "ac_matrix" : (T, n_lags) float
-        Full autocorrelation map on the sample timeline.  Entry [i, j] is the
-        autocorrelation at lag ac_lag_ms[j] ms for the window covering sample i.
-        NaN at samples not covered by any window.
+        Full autocorrelation map on the sample timeline.  NaN where skipped.
 
     "peak_ac" : (T,) float
-        Maximum autocorrelation across all target lags for the window covering
-        each sample.  This scalar is what the detection thresholds operate on.
-        NaN at uncovered samples.
+        Maximum autocorrelation across target lags per sample.  NaN where skipped.
 
     "rms" : (T,) float
-        Rolling RMS computed over the same windows as the AC map.
-        NaN at uncovered samples.
+        Rolling RMS per sample.  NaN where skipped.
 
     "ac_lag_ms" : (n_lags,) float
-        Lag axis in milliseconds, corresponding to the columns of "ac_matrix".
-        Spans from fs/highcut ms (shortest lag, highest freq) to fs/lowcut ms
-        (longest lag, lowest freq).
+        Lag axis in milliseconds.
     """
     signal_uv = np.asarray(signal_uv, dtype=float)
     T         = len(signal_uv)
-    times_s   = np.arange(T) / fs   # sample timestamps in seconds
+    times_s   = np.arange(T) / fs
+
+    step_samp     = max(1, int(ac_step_ms / 1000.0 * fs))
+    step_s        = ac_step_ms / 1000.0
 
     # ------------------------------------------------------------------
-    # Stage 1: Sliding autocorrelation
-    # Produces ac_mat_wins (n_lags, n_windows) and scalar diagnostics per window.
-    # ------------------------------------------------------------------
-    ac_mat_wins, ac_lag_ms, win_centers_ms, win_starts, win_samp = \
-        _sliding_autocorr_map(
-            signal_uv, fs,
-            win_ms    = ac_window_ms,
-            step_ms   = ac_step_ms,
-            lag_lo_hz = highcut,   # higher frequency → shorter lag
-            lag_hi_hz = lowcut,    # lower  frequency → longer  lag
-        )
-    n_lags, n_wins = ac_mat_wins.shape
-    win_centers_s  = win_centers_ms / 1000.0
-    step_s         = ac_step_ms / 1000.0
-
-    # Peak AC: the single most-correlated lag in each window.
-    # This is the primary detection feature — one number per window.
-    peak_ac_wins = np.nanmax(ac_mat_wins, axis=0)   # (n_windows,)
-
-    # ------------------------------------------------------------------
-    # Stage 2: Rolling RMS
-    # Computed over the same windows as the AC map for consistent temporal
-    # resolution.  Used by the silence gate and returned as a diagnostic.
-    # ------------------------------------------------------------------
-    rms_wins = np.array([
-        np.sqrt(np.mean(signal_uv[s : s + win_samp] ** 2))
-        for s in win_starts
-    ])   # (n_windows,)
-
-    # ------------------------------------------------------------------
-    # Stage 3: Silence gate
-    # Windows below the RMS threshold are excluded from all A-train logic.
-    # above_silence_wins[i] = True  ↔  window i is active (not silent).
-    # ------------------------------------------------------------------
-    above_silence_wins = rms_wins >= rms_silence_threshold_uv   # (n_windows,) bool
-
-    # ------------------------------------------------------------------
-    # Stage 4a: Core A-train windows (seeds)
-    # Must be both non-silent and strongly periodic.
-    # ------------------------------------------------------------------
-    core_wins = (peak_ac_wins >= ac_core_threshold) & above_silence_wins
-
-    # ------------------------------------------------------------------
-    # Stage 4b: Grow A-train cores (flood-fill)
-    # A window is "adjacent eligible" if it is non-silent and meets the
-    # weaker adjacent threshold.  The flood-fill propagates the current
-    # A-train set into eligible neighbours until convergence.
-    # ------------------------------------------------------------------
-    adj_eligible_wins = (peak_ac_wins >= ac_adjacent_threshold) & above_silence_wins
-
-    atrain_wins = core_wins.copy()
-    while True:
-        expanded        = atrain_wins.copy()
-        expanded[1:]   |= atrain_wins[:-1]   # try to grow rightward (later in time)
-        expanded[:-1]  |= atrain_wins[1:]    # try to grow leftward  (earlier in time)
-        expanded       &= adj_eligible_wins   # only keep eligible positions
-        if np.array_equal(expanded, atrain_wins):
-            break   # stable — no further growth possible
-        atrain_wins = expanded
-
-    # ------------------------------------------------------------------
-    # Stage 4c: Merge short gaps between A-train candidates
-    # Convert the ms gap threshold to window steps, then bridge short gaps.
-    # ------------------------------------------------------------------
-    merge_gap_steps    = int(np.ceil(ac_merge_gap_ms / ac_step_ms))
-    atrain_wins_merged = _merge_atrain_gaps(atrain_wins, merge_gap_steps)
-
-    # ------------------------------------------------------------------
-    # Stage 5: Project window-level results back to the sample timeline.
+    # Pre-compute lag bounds so we know the padding size before any AC work.
     #
-    # Each window covers a half-open interval centred on win_centers_s[wi]:
-    #   [center - step/2,  center + step/2)
-    # Samples at the signal edges that fall outside all windows retain their
-    # fill values (NaN for float, False for bool).
+    # lag_hi_samp is the longest lag (= fs / lowcut), which sets both:
+    #   • the lag range evaluated by _sliding_autocorr_map
+    #   • the minimum window length (win_samp ≥ lag_hi_samp * 3)
+    # We use the same clamped window estimate for padding so that windows
+    # centred near a chunk boundary always have full data available.
     # ------------------------------------------------------------------
+    lag_lo_samp   = max(1, int(fs / highcut))
+    lag_hi_samp   = int(fs / lowcut) + 1
+    lags          = np.arange(lag_lo_samp, lag_hi_samp + 1)
+    n_lags        = len(lags)
+    ac_lag_ms     = lags / fs * 1000.0
 
-    def _wins_to_samples_float(win_vals, fill=np.nan):
-        """Project (n_windows,) float values onto the (T,) sample timeline."""
-        out = np.full(T, fill, dtype=float)
-        for wi, v in enumerate(win_vals):
-            tc  = win_centers_s[wi]
-            idx = np.where(
-                (times_s >= tc - step_s / 2) & (times_s < tc + step_s / 2)
-            )[0]
-            out[idx] = v
-        return out
+    # Conservative estimate of the clamped window length (mirrors logic in
+    # _sliding_autocorr_map) — used only to size the padding.
+    win_samp_req  = int(ac_window_ms / 1000.0 * fs)
+    win_samp_est  = max(win_samp_req, lag_hi_samp * 3)
+    # pad = half a window so AC windows near the chunk edge are fully inside
+    pad_samp      = win_samp_est // 2 + 1
 
-    def _wins_to_samples_bool(win_mask):
-        """Project (n_windows,) bool mask onto the (T,) sample timeline."""
+    # ------------------------------------------------------------------
+    # Stage 1: Fast vectorised rolling RMS over the whole signal.
+    # This is cheap (no Python loop) and determines which regions need AC.
+    # ------------------------------------------------------------------
+    rms_wins_full, win_starts_full = _rolling_rms(signal_uv, win_samp_est, step_samp)
+    n_wins_full                    = len(rms_wins_full)
+
+    above_silence_wins_full = rms_wins_full >= rms_silence_threshold_uv
+
+    # ------------------------------------------------------------------
+    # Stage 2: Find active chunks — contiguous groups of above-threshold
+    # windows, padded and merged.
+    # ------------------------------------------------------------------
+    chunks = _active_chunks(
+        above_silence_wins_full, win_starts_full, win_samp_est,
+        pad_samp, T
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 3: Compute silence mask from the full-signal RMS pass.
+    # This mirrors the original logic exactly:
+    #   silence_samples = ~_wins_to_samples_bool(above_silence_wins_full)
+    # Every sample whose covering window was below threshold → True (silent).
+    # Samples at the signal edges not covered by any window → False.
+    # ------------------------------------------------------------------
+    def _wins_to_samples_bool(win_mask, win_starts, win_samp, step_s_inner):
         out = np.zeros(T, dtype=bool)
         for wi, v in enumerate(win_mask):
             if not v:
                 continue
-            tc  = win_centers_s[wi]
+            tc  = (win_starts[wi] + win_samp // 2) / fs
             idx = np.where(
-                (times_s >= tc - step_s / 2) & (times_s < tc + step_s / 2)
+                (times_s >= tc - step_s_inner / 2) &
+                (times_s <  tc + step_s_inner / 2)
             )[0]
             out[idx] = True
         return out
 
-    # Continuous diagnostics — returned as-is for display
-    peak_ac_samples = _wins_to_samples_float(peak_ac_wins, fill=np.nan)
-    rms_samples     = _wins_to_samples_float(rms_wins,     fill=np.nan)
-
-    # Silence: invert above_silence so True = "this sample is silent"
-    silence_samples = ~_wins_to_samples_bool(above_silence_wins)
-
-    # A-train mask before duration filter
-    atrain_samples_raw = _wins_to_samples_bool(atrain_wins_merged)
-
-    # Duration filter: discard A-trains shorter than ac_min_dur_ms.
-    # Applied on the sample-level mask for sample-accurate timing.
-    atrain_samples = _discard_short_atrains(
-        atrain_samples_raw, times_s, ac_min_dur_ms / 1000.0
+    silence_samples = ~_wins_to_samples_bool(
+        above_silence_wins_full, win_starts_full, win_samp_est, step_s
     )
 
     # ------------------------------------------------------------------
-    # Build sample-aligned AC matrix: (T, n_lags)
-    # Each row receives the AC vector of the window covering that sample.
-    # Orientation: rows = time (samples), columns = lags (ascending ms).
+    # Allocate remaining full-signal output arrays (NaN / False by default).
+    # AC, peak_ac, and rms are only filled inside processed chunks.
     # ------------------------------------------------------------------
     ac_matrix_samples = np.full((T, n_lags), np.nan, dtype=float)
-    for wi in range(n_wins):
-        tc  = win_centers_s[wi]
-        idx = np.where(
-            (times_s >= tc - step_s / 2) & (times_s < tc + step_s / 2)
-        )[0]
-        ac_matrix_samples[idx, :] = ac_mat_wins[:, wi]   # broadcast column to rows
+    peak_ac_samples   = np.full(T, np.nan,   dtype=float)
+    rms_samples       = np.full(T, np.nan,   dtype=float)
+    atrain_raw        = np.zeros(T,          dtype=bool)
+
+    # ------------------------------------------------------------------
+    # Stage 4: Process each active chunk independently.
+    # ------------------------------------------------------------------
+    for (chunk_start, chunk_end) in chunks:
+        chunk     = signal_uv[chunk_start:chunk_end]
+        chunk_len = len(chunk)
+
+        # --- AC map on this chunk ---
+        ac_mat_wins, _, win_centers_ms_local, win_starts_local, win_samp = \
+            _sliding_autocorr_map(
+                chunk, fs,
+                win_ms    = ac_window_ms,
+                step_ms   = ac_step_ms,
+                lag_lo_hz = highcut,
+                lag_hi_hz = lowcut,
+            )
+
+        n_wins_chunk  = ac_mat_wins.shape[1]
+        win_centers_s_local = win_centers_ms_local / 1000.0
+        # Convert chunk-local sample indices to full-signal sample indices
+        win_starts_global   = win_starts_local + chunk_start
+
+        # --- Peak AC and RMS per window ---
+        peak_ac_wins_chunk = np.nanmax(ac_mat_wins, axis=0)   # (n_wins_chunk,)
+        rms_wins_chunk     = np.array([
+            np.sqrt(np.mean(chunk[s : s + win_samp] ** 2))
+            for s in win_starts_local
+        ])
+
+        above_silence_chunk = rms_wins_chunk >= rms_silence_threshold_uv
+
+        # --- Silence and A-train detection on this chunk's windows ---
+        core_wins_chunk = (peak_ac_wins_chunk >= ac_core_threshold) & above_silence_chunk
+        adj_eligible    = (peak_ac_wins_chunk >= ac_adjacent_threshold) & above_silence_chunk
+
+        atrain_wins_chunk = core_wins_chunk.copy()
+        while True:
+            expanded        = atrain_wins_chunk.copy()
+            expanded[1:]   |= atrain_wins_chunk[:-1]
+            expanded[:-1]  |= atrain_wins_chunk[1:]
+            expanded       &= adj_eligible
+            if np.array_equal(expanded, atrain_wins_chunk):
+                break
+            atrain_wins_chunk = expanded
+
+        merge_gap_steps   = int(np.ceil(ac_merge_gap_ms / ac_step_ms))
+        atrain_wins_chunk = _merge_atrain_gaps(atrain_wins_chunk, merge_gap_steps)
+
+        # --- Project window-level results back to full-signal sample timeline ---
+        # Only write into the portion of the full arrays covered by this chunk.
+        chunk_times_s = times_s[chunk_start:chunk_end]
+
+        for wi in range(n_wins_chunk):
+            tc  = win_starts_s = chunk_start / fs + win_centers_s_local[wi]
+            # Samples in the full signal that this window covers
+            idx = np.where(
+                (times_s >= tc - step_s / 2) & (times_s < tc + step_s / 2)
+            )[0]
+            if len(idx) == 0:
+                continue
+
+            ac_matrix_samples[idx, :] = ac_mat_wins[:, wi]
+            peak_ac_samples[idx]      = peak_ac_wins_chunk[wi]
+            rms_samples[idx]          = rms_wins_chunk[wi]
+
+            if atrain_wins_chunk[wi]:
+                atrain_raw[idx] = True
+
+    # ------------------------------------------------------------------
+    # Stage 5: Duration filter on the full-signal sample mask.
+    # ------------------------------------------------------------------
+    atrain_samples = _discard_short_atrains(
+        atrain_raw, times_s, ac_min_dur_ms / 1000.0
+    )
 
     return {
-        "atrains":   atrain_samples,      # (T,) bool   — final A-train mask
-        "silence":   silence_samples,     # (T,) bool   — silence mask
-        "ac_matrix": ac_matrix_samples,   # (T, n_lags) — autocorrelation map
-        "peak_ac":   peak_ac_samples,     # (T,) float  — peak AC per sample
-        "rms":       rms_samples,         # (T,) float  — RMS per sample
-        "ac_lag_ms": ac_lag_ms,           # (n_lags,)   — lag axis in ms
+        "atrains":   atrain_samples,    # (T,) bool
+        "silence":   silence_samples,   # (T,) bool
+        "ac_matrix": ac_matrix_samples, # (T, n_lags) — NaN where skipped
+        "peak_ac":   peak_ac_samples,   # (T,) float  — NaN where skipped
+        "rms":       rms_samples,       # (T,) float  — NaN where skipped
+        "ac_lag_ms": ac_lag_ms,         # (n_lags,)
     }
