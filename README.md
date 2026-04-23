@@ -26,25 +26,26 @@ pip install git+https://github.com/DrMartinCerny/emg-signalomics.git
 ## Quick start
 
 ```python
-import numpy as np
+import mne
 from emg_signalomics.detect.atrain import detect_atrains
 
-# signal_uv: 1-D bandpassed signal in microvolts
-# fs:        sampling rate in Hz
-result = detect_atrains(signal_uv, fs)
+raw = mne.io.read_raw_fif("recording.fif", preload=True)
 
-atrain_mask = result["atrains"]    # (T,) bool — final A-train mask
-silence     = result["silence"]    # (T,) bool — silence (low-RMS) mask
-peak_ac     = result["peak_ac"]    # (T,) float — per-sample peak autocorrelation
+annotations = detect_atrains(raw)
+raw.set_annotations(raw.annotations + annotations)
+
+# Each annotation has description "ATRAIN_{channel_name}".
+# Filter by channel:
+fp1_atrains = [a for a in raw.annotations if a["description"] == "ATRAIN_Fp1"]
 ```
 
-See the docstring of `detect_atrains` for the full list of tunable
-parameters and output arrays.
+See the docstring of `detect_atrains` for the full list of tunable parameters.
 
 ## Requirements
 
 - Python ≥ 3.9
 - NumPy ≥ 1.20
+- MNE-Python ≥ 1.0
 
 ## License
 
