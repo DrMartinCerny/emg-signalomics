@@ -48,6 +48,18 @@ fp1_atrains = [a for a in raw.annotations if a["description"] == "ATRAIN_Fp1"]
 Loaders follow the pattern `emg_signalomics.load.{vendor}.{machine}` and each
 exposes a `load_{machine}` function that returns a vanilla `mne.io.Raw`,
 ready to be passed to the detection routines above or to any MNE workflow.
+Each module also exposes a matching `head_{machine}` function that returns a
+metadata dict (`channel_names`, `sfreq`, `meas_date`, filter cutoffs, ...)
+without converting any waveform samples — useful for picking a file out of
+a batch or sanity-checking a recording before committing to the full load:
+
+```python
+from emg_signalomics.load.cadwell.cascade import head_cascade
+from emg_signalomics.load.nim.eclipse import head_eclipse
+
+print(head_cascade("Raw EMG Raw Data.csv")["sfreq"])  # 1250.0
+print(head_eclipse("18.csv")["channel_names"])        # ['V MASSETER', ...]
+```
 
 ### Cadwell Cascade / IOMax
 

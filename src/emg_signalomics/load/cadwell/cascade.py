@@ -18,6 +18,13 @@ load_cascade(path, *, channels_to_keep=None, max_samples=None) -> mne.io.Raw
     channel data in Volts) and to surface sample-index discontinuities as
     ``BAD_gap`` annotations.
 
+head_cascade(path) -> dict
+    Read only the header + per-channel metadata block (the first 8 rows of
+    the file) and return ``{"channel_names": ..., "sfreq": ..., "meas_date":
+    ..., "highpass": ..., "lowpass": ..., "notch": ..., "units": ...,
+    "format": "cadwell_cascade_csv", "source_file": ...}``.  Useful for
+    deciding whether to load the full file.
+
 Sanitized example (NOT real data; channel names and values are illustrative only).
 You can copy-paste this into a .csv and it should parse:
 Name;EMG_CH01;EMG_CH02;EMG_CH03
@@ -104,27 +111,9 @@ def load_cascade(
 
     # ---- metadata block (7 rows after header) ----
     # Parsed only to derive the standard MNE fields below.  Not stored on the
-    # Raw object — callers who need the raw Cadwell header should re-read the
-    # CSV themselves.
-    meta_block = pd.read_csv(
-        path,
-        sep=";",
-        header=None,
-        nrows=7,
-        skiprows=1,
-        encoding="utf-8",
-    )
-
-    col_index = {name: idx for idx, name in enumerate(cols)}
-    channel_meta: Dict[str, Dict[str, Any]] = {ch: {} for ch in channels}
-
-    for _, row in meta_block.iterrows():
-        key = str(row.iloc[0]).strip()
-        if not key or key.lower() == "nan":
-            continue
-        for ch in channels:
-            idx = col_index[ch]
-            channel_meta[ch][key] = row.iloc[idx] if idx < len(row) else None
+    # Raw object — callers who need the raw Cadwell header should use
+    # ``head_cascade`` or re-read the CSV themselves.
+    channel_meta = _read_channel_meta_block(path, cols, list(channels))
 
     fs = _infer_fs_from_channel_meta(channel_meta, list(channels))
     start_ts_naive = _infer_start_timestamp(channel_meta, list(channels))
@@ -189,6 +178,78 @@ def load_cascade(
     return raw
 
 
+def head_cascade(path: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Read only the header + per-channel metadata block of a Cadwell CSV.
+
+    This touches only the first 8 rows of the file — the column header and
+    the seven metadata rows — and never opens the waveform block, so it is
+    cheap even for multi-gigabyte exports.
+
+    Parameters
+    ----------
+    path : str | pathlib.Path
+        Path to the CSV file.
+
+    Returns
+    -------
+    dict
+        ``{
+            "format":        "cadwell_cascade_csv",
+            "source_file":   str(path),
+            "channel_names": [...],
+            "n_channels":    int,
+            "sfreq":         float (Hz, derived from "Period (s)"),
+            "meas_date":     UTC-aware datetime | None,
+            "units":         str,        # the original "Units" field
+            "highpass":      float | None,  # from "Lowcut (Hz)"
+            "lowpass":       float | None,  # from "Highcut (Hz)"
+            "notch":         str | None,    # the raw "Notch" field, e.g. "On"/"Off"
+        }``
+    """
+    path = Path(path)
+
+    cols = _read_header_columns_fast(path)
+    if not cols:
+        raise ValueError(f"No columns found in {path}")
+    timing_col = "Name" if "Name" in cols else cols[0]
+    channels = [c for c in cols if c != timing_col]
+    if not channels:
+        raise ValueError(
+            f"No EMG channels found in {path} (timing_col={timing_col!r})."
+        )
+
+    channel_meta = _read_channel_meta_block(path, cols, channels)
+
+    fs = _infer_fs_from_channel_meta(channel_meta, channels)
+    start_ts_naive = _infer_start_timestamp(channel_meta, channels)
+    units = _infer_units(channel_meta, channels)
+    meas_date = (
+        start_ts_naive.replace(tzinfo=timezone.utc)
+        if start_ts_naive is not None
+        else None
+    )
+
+    first = channel_meta[channels[0]]
+    lff = _parse_float_maybe(first.get("Lowcut (Hz)"))
+    hff = _parse_float_maybe(first.get("Highcut (Hz)"))
+    notch_raw = first.get("Notch")
+    notch = str(notch_raw).strip() if notch_raw is not None else None
+
+    return {
+        "format": "cadwell_cascade_csv",
+        "source_file": str(path),
+        "channel_names": list(channels),
+        "n_channels": len(channels),
+        "sfreq": float(fs),
+        "meas_date": meas_date,
+        "units": units,
+        "highpass": lff,
+        "lowpass": hff,
+        "notch": notch,
+    }
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -201,6 +262,34 @@ def _read_header_columns_fast(path: Path) -> List[str]:
     with path.open("r", encoding="utf-8", errors="replace") as f:
         line = f.readline().strip("\n\r")
     return [_norm_col(x) for x in line.split(";")]
+
+
+def _read_channel_meta_block(
+    path: Path, cols: List[str], channels: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Read the 7-row Cadwell metadata block (Time, Gain, Highcut, Lowcut, Notch,
+    Period (s), Units) and return ``{channel_name: {key: value}}``.
+    """
+    meta_block = pd.read_csv(
+        path,
+        sep=";",
+        header=None,
+        nrows=7,
+        skiprows=1,
+        encoding="utf-8",
+    )
+
+    col_index = {name: idx for idx, name in enumerate(cols)}
+    channel_meta: Dict[str, Dict[str, Any]] = {ch: {} for ch in channels}
+    for _, row in meta_block.iterrows():
+        key = str(row.iloc[0]).strip()
+        if not key or key.lower() == "nan":
+            continue
+        for ch in channels:
+            idx = col_index[ch]
+            channel_meta[ch][key] = row.iloc[idx] if idx < len(row) else None
+    return channel_meta
 
 
 def _parse_float_maybe(x: Any) -> Optional[float]:

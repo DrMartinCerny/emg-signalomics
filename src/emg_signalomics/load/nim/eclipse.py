@@ -29,6 +29,13 @@ Public API
 load_eclipse(path, *, channels_to_keep=None, max_samples=None) -> mne.io.Raw
     Load a NIM Eclipse Raw EMG CSV and return an MNE Raw object.
 
+head_eclipse(path) -> dict
+    Walk the file with csv.reader but skip every sample-string conversion,
+    returning ``{"channel_names": ..., "sfreq": ..., "meas_date": ...,
+    "n_epochs": ..., "samples_per_epoch": ..., "n_samples": ..., "highpass":
+    ..., "lowpass": ..., "notch": ..., "test_name": ..., "duration_s": ...,
+    "format": "nim_eclipse_csv", "source_file": ...}``.
+
 Units
 -----
 The Eclipse file does not carry an explicit unit field for the Raw EMG
@@ -269,6 +276,147 @@ def load_eclipse(
     return raw
 
 
+def head_eclipse(path: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Read only header + per-trace metadata of a NIM Eclipse Raw EMG CSV.
+
+    The whole file is still walked (channels appear as one trace per second
+    of recording, so we have to scan to the end to know the channel set and
+    epoch count) but no sample-string is converted to float, which is the
+    expensive part of :func:`load_eclipse`.
+
+    Parameters
+    ----------
+    path : str | pathlib.Path
+        Path to the CSV file.
+
+    Returns
+    -------
+    dict
+        ``{
+            "format":            "nim_eclipse_csv",
+            "source_file":       str(path),
+            "test_name":         str | None,    # from the "Test name:" header
+            "channel_names":     [...],         # unique Tr Names, in first-seen order
+            "n_channels":        int,
+            "sfreq":             float,         # samples_per_epoch / typical inter-epoch interval
+            "meas_date":         UTC-aware datetime | None,  # first epoch start
+            "n_epochs":          int,
+            "samples_per_epoch": int,           # from the column header (count of "0..N-1" cols)
+            "n_samples":         int,           # samples_per_epoch * n_epochs
+            "duration_s":        float,         # n_samples / sfreq
+            "highpass":          float | None,  # from LFF
+            "lowpass":           float | None,  # from HFF
+            "notch":             str | None,    # raw "Notch" field
+        }``
+    """
+    path = Path(path)
+    rows = _read_csv_rows(path)
+
+    test_name = _extract_test_name(rows)
+
+    hdr_start = next(
+        (i for i, r in enumerate(rows) if r and r[0].strip().startswith("Mod No")),
+        None,
+    )
+    if hdr_start is None:
+        raise ValueError(
+            f"Could not find 'Mod No' column header in {path}; this does not "
+            f"look like a NIM Eclipse Raw EMG CSV export."
+        )
+
+    j = hdr_start
+    column_header: List[str] = []
+    while j < len(rows) and rows[j]:
+        column_header.extend(s.strip() for s in rows[j])
+        j += 1
+    samples_per_epoch_decl = len(column_header) - len(_META_COLS)
+    if samples_per_epoch_decl <= 0:
+        raise ValueError(
+            f"Column header in {path} declares {samples_per_epoch_decl} sample "
+            "columns; cannot continue."
+        )
+
+    while j < len(rows) and not rows[j]:
+        j += 1
+
+    # ---- walk per-trace blocks, but only parse the first 8 metadata fields
+    channel_names: List[str] = []
+    epoch_starts_set = set()
+    first_meta: Optional[Dict[str, str]] = None
+
+    while j < len(rows):
+        r = rows[j]
+        if not r:
+            j += 1
+            continue
+        if len(r) != 1:
+            j += 1
+            continue
+
+        # Parse only enough of the inner CSV to recover the 8 metadata fields.
+        # We don't need to extend with continuation rows because the metadata
+        # always sits in the very first physical line of the trace.
+        inner = next(csv.reader([r[0]]))
+        j += 1
+        # Skip continuation rows without parsing them
+        while j < len(rows) and len(rows[j]) > 1:
+            j += 1
+
+        if len(inner) < len(_META_COLS):
+            continue
+
+        meta = {col: str(inner[k]).strip() for k, col in enumerate(_META_COLS)}
+        meta["Tr Name"] = meta["Tr Name"].strip()
+        dt = _parse_eclipse_datetime(meta["Date Time"])
+
+        if first_meta is None:
+            first_meta = meta
+        if meta["Tr Name"] and meta["Tr Name"] not in channel_names:
+            channel_names.append(meta["Tr Name"])
+        if dt is not None:
+            epoch_starts_set.add(dt)
+
+    if not channel_names:
+        raise ValueError(f"No traces found after the header in {path}.")
+
+    epoch_starts = sorted(epoch_starts_set)
+    n_epochs = len(epoch_starts)
+
+    fs, _ = _infer_sampling_rate(epoch_starts, samples_per_epoch_decl)
+    n_samples = samples_per_epoch_decl * n_epochs
+
+    if first_meta is not None:
+        lff = _parse_float_maybe(first_meta.get("LFF"))
+        hff = _parse_float_maybe(first_meta.get("HFF"))
+        notch_raw = first_meta.get("Notch")
+        notch = str(notch_raw).strip() if notch_raw is not None else None
+    else:
+        lff = hff = None
+        notch = None
+
+    meas_date = (
+        epoch_starts[0].replace(tzinfo=timezone.utc) if epoch_starts else None
+    )
+
+    return {
+        "format": "nim_eclipse_csv",
+        "source_file": str(path),
+        "test_name": test_name,
+        "channel_names": channel_names,
+        "n_channels": len(channel_names),
+        "sfreq": float(fs),
+        "meas_date": meas_date,
+        "n_epochs": n_epochs,
+        "samples_per_epoch": int(samples_per_epoch_decl),
+        "n_samples": int(n_samples),
+        "duration_s": float(n_samples) / float(fs) if fs else None,
+        "highpass": lff,
+        "lowpass": hff,
+        "notch": notch,
+    }
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -278,6 +426,24 @@ def _read_csv_rows(path: Path) -> List[List[str]]:
     csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
     with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
         return list(csv.reader(f))
+
+
+def _extract_test_name(rows: List[List[str]]) -> Optional[str]:
+    """
+    Pull the test name out of the free-form text header.  The first line of an
+    Eclipse export wraps the name in nested CSV quoting (one outer pair plus
+    an embedded escaped pair); csv.reader unquotes the outer layer so r[0]
+    looks like ``Test name: "<name>"``.  We strip the prefix and surrounding
+    quotes to give back just ``<name>``.
+    """
+    for r in rows[:6]:
+        if not r:
+            continue
+        s = r[0]
+        if s.startswith("Test name:"):
+            v = s[len("Test name:") :].strip()
+            return v.strip('"').strip()
+    return None
 
 
 def _parse_trace_blocks(
