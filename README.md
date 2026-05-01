@@ -12,8 +12,7 @@ CSV exports into MNE.
 - `emg_signalomics.load.{vendor}.{machine}` — vendor- and machine-specific
   CSV loaders that return an `mne.io.Raw`. Currently shipped:
   - `load.cadwell.cascade.load_cascade` — Cadwell Cascade / IOMax CSV.
-  - `load.nim.eclipse.load_eclipse` — Medtronic NIM Eclipse (placeholder,
-    raises `NotImplementedError`).
+  - `load.nim.eclipse.load_eclipse` — Medtronic NIM Eclipse "Raw EMG" CSV.
 
 ## Installation
 
@@ -75,13 +74,26 @@ Sample-index discontinuities in the source file are surfaced as standard MNE
 
 ### Medtronic NIM Eclipse
 
-The Eclipse loader is a placeholder until the export format is wired up:
-
 ```python
 from emg_signalomics.load.nim.eclipse import load_eclipse
 
-raw = load_eclipse("eclipse_export.csv")  # raises NotImplementedError
+raw = load_eclipse("18.csv")
 ```
+
+The Eclipse "Raw EMG" export is much less tidy than the Cadwell one — its
+header is free-form text, the column header wraps across multiple physical
+lines, and each per-second per-channel "trace" is serialised as a single
+quoted CSV cell whose contents are themselves a CSV record (with embedded
+escaped quotes and a 32 KiB hard-wrap to extra physical lines).  The loader
+re-glues those pieces, recovers each channel from the `Tr Name` field,
+infers `sfreq` from the per-epoch sample count and the spacing between
+consecutive `Date Time` stamps, and returns a regular `mne.io.Raw`.  Filter
+cutoffs are taken from `LFF` / `HFF`; non-contiguous epochs become standard
+`BAD_gap` annotations.
+
+The Eclipse format does not declare units; samples are assumed to be
+microvolts (the typical Eclipse default for Raw EMG) and the returned Raw
+is in Volts as MNE expects.
 
 ## Requirements
 
